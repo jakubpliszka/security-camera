@@ -1,104 +1,115 @@
-import cv2
-import datetime
+import collections
+import os
 import threading
 import time
-import numpy as np
+from datetime import datetime, timezone
 
+import cv2
 
-from pymongo import MongoClient
+RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "recordings")
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 
 class SecurityCamera:
     FOREGROUND_RATIO_THRESHOLD = 0.01
+    PRE_BUFFER_SECONDS = 5
+    POST_BUFFER_SECONDS = 5
 
     def __init__(self, name: str = "Camera 1", location: str = "Room") -> None:
         self.name = name
         self.location = location
 
-        # initialize the camera (use the first camera device available)
         self.camera = cv2.VideoCapture(0)
-        time.sleep(2)  # Warm up the camera
-        self.running = False
+        self.recording = False
 
-        # connect to the MongoDB database
-        client = MongoClient("mongodb://localhost:27017/")
-        db = client["security"]
-        self.collection = db["motions"]
+        self._fps = int(self.camera.get(cv2.CAP_PROP_FPS)) or 30
+        self._width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._frame_buffer = collections.deque(maxlen=self.PRE_BUFFER_SECONDS * self._fps)
+        self._lock = threading.Lock()
+        self._stop_recording_event = threading.Event()
 
-    def start(self) -> None:
-        # early exit if the camera is already running
-        if self.running:
-            return
+        self.latest_frame = None
 
-        self.running = True
+        self._running = True
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
 
-        # start a background thread for capturing frames
-        self.thread = threading.Thread(target=self.run)
-        self.thread.start()
-
-    def stop(self) -> None:
-        self.running = False
-        # start a background thread for standby mode
-        self.thread = threading.Thread(target=self.standby)
-        self.thread.start()
+    def __del__(self) -> None:
+        self._running = False
+        self._stop_recording_event.set()
+        self._thread.join()
 
     def run(self) -> None:
-        # initialize the background model
         background_subtractor = cv2.createBackgroundSubtractorMOG2()
+        last_motion_time = None
+        recording_thread = None
+        self.recording = False
+        self._stop_recording_event.clear()
 
-        # capture frames from the camera and detect motion
-        while self.running:
+        while self._running:
             ret, frame = self.camera.read()
             if not ret:
-                break
+                print("Failed to read frame from camera")
+                continue
 
-            # apply the background subtraction algorithm to the frame
+            self.latest_frame = frame.copy()
+
+            # add frame to pre-buffer (for motion‐triggered recording)
+            with self._lock:
+                self._frame_buffer.append(frame.copy())
+
             foreground_mask = background_subtractor.apply(frame)
-
-            # apply morphological operations to remove noise from the mask
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            foreground_mask = cv2.morphologyEx(
-                foreground_mask, cv2.MORPH_OPEN, kernel)
-
-            # calculate the percentage of the mask that is "foreground" (i.e., motion)
+            foreground_mask = cv2.morphologyEx(foreground_mask, cv2.MORPH_OPEN, kernel)
             foreground_area = cv2.countNonZero(foreground_mask)
             total_area = foreground_mask.shape[0] * foreground_mask.shape[1]
             foreground_ratio = foreground_area / total_area
 
-            # if the percentage of foreground is above a threshold, motion is detected
             if foreground_ratio > self.FOREGROUND_RATIO_THRESHOLD:
-                self.motion_detected(frame)
-                print("Motion Detected")
+                last_motion_time = time.time()
+                if not self.recording:
+                    print("Motion Detected - Start Recording")
+                    self.recording = True
+                    self._stop_recording_event.clear()
+                    recording_thread = threading.Thread(target=self.record_video, daemon=True)
+                    recording_thread.start()
+            else:
+                if (
+                    self.recording
+                    and last_motion_time is not None
+                    and time.time() - last_motion_time > self.POST_BUFFER_SECONDS
+                ):
+                    print("No motion - stop recording")
+                    self._stop_recording_event.set()
+                    if recording_thread:
+                        recording_thread.join()
 
-            # display the original frame and the foreground mask for debugging
-            cv2.imshow("Original Frame", frame)
-            cv2.imshow("Foreground Mask", foreground_mask)
+                    self.recording = False
+                    last_motion_time = None
 
-            # wait for a key press to exit the loop
-            if cv2.waitKey(1) == ord('q'):
-                break
-
-        # cClean up
         self.camera.release()
-        cv2.destroyAllWindows()
 
-    def motion_detected(self, frame: np.ndarray) -> None:
-        # get the current time
-        now = datetime.datetime.now()
+    def record_video(self) -> None:
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(RECORDINGS_DIR, f"motion_{timestamp}.avi")
+        out = cv2.VideoWriter(filename, fourcc, self._fps, (self._width, self._height))
 
-        # create a document to insert into the database
-        motion_event = {
-            "time": now,
-            "location": self.location,
-            "camera": self.name,
-            "description": "Motion Detected",
-            "image": frame
-        }
+        # write pre-buffered frames first
+        with self._lock:
+            pre_buffer = list(self._frame_buffer)
 
-        # insert the document into the database
-        self.collection.insert_one(motion_event)
+        for frame in pre_buffer:
+            out.write(frame)
 
-    def standby(self) -> None:
-        while not self.running:
-            time.sleep(1)
-            print("Standby Mode")
+        # write frames until stop event is set
+        while not self._stop_recording_event.is_set() and self._running:
+            ret, frame = self.camera.read()
+            if not ret:
+                print("Failed to read frame from camera")
+                continue
+
+            out.write(frame)
+
+        out.release()
